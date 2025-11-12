@@ -1,0 +1,143 @@
+============================================================
+                 BCV - Jacobi without the implementation of SVD
+============================================================
+
+What is the goal?
+-----------------
+First orthogonalize the main matrix A. Then approximate the 
+singular values in column norms. There is no full decomposition 
+such as the SVD.
+
+
+How it is implemented?
+----------------------
+1. Matrix split into blocks  
+
+2. Pick two blocks (they are stored into the matrix U).  
+
+3. Jacobi rotations  
+   - For each pair of columns in U, compute a Givens rotation (c,s) 
+     to reduce off-diagonal correlation.  
+   - Then apply it to those columns so that they become more orthogonal.  
+   - This process is repeated for 2k-1 rounds to sweep through all pairs.  
+
+4. Store back  
+   - Replacing the two original blocks in A with the updated ones.  
+
+5. Sweep loop  
+   - Iterating over all block pairs, repeating till convergence.  
+
+6. Normalization  
+   - All columns of A are normalized.  
+   - Column norms approximate the singular values.  
+   - Only left singular vectors are tracked.  
+
+
+============================================================
+                 BCV - Jacobi with SVD implementation
+============================================================
+
+What are the changes in the implementation?
+-------------------------------------------
+- Until step 3, same process as above.  
+- Instead of storing back, here we apply rotations to V.  
+
+{Keep a global matrix V ∈ Rⁿ×ⁿ initialized as identity.  
+ For each Jacobi rotation on columns i,j, apply the same 2×2 rotation 
+ to columns i,j of V.  
+ After all sweeps: V accumulates the full product of Jacobi rotations 
+ → right singular vectors.}  
+
+Then again, the same Normalization.
+
+
+Complexity Comparison
+---------------------
+- BCV: O(m·n²)  
+- BCV-SVD: O(m·n² + n³)  
+
+Explanation:  
+- BCV is block-based with updates, cost O(m·n²).  
+- BCV-SVD adds rotations on V (extra n³).  
+
+Execution Time (gprof reports):  
+- For small datasets → execution times identical.  
+- For large datasets → BCV-SVD was 2–3x slower.  
+
+Reason: Rotations on V introduce n³ complexity.
+
+
+============================================================
+   Profiling Insights and Parallelization Considerations
+============================================================
+
+- In BCV:
+  * Execution is sequential and dependent step-by-step.  
+
+- In BCV-SVD:
+  * Rotations on V can be parallelized.  
+  * Parallelization possible via OpenMP and CUDA.  
+  * BCV-SVD benefits more in practice from parallelization.  
+
+Other components:
+- Many remain non-parallelizable due to dependency.  
+
+Why focus on BCV implementation with SVD?
+-----------------------------------------
+- Plain BCV:
+  * Only orthogonalizes A and approximates singular values.  
+
+- BCV-SVD:
+  * Produces full decomposition by tracking right singular vectors in V.  
+  * Broader applicability in ML and scientific computing.  
+  * Although slower sequentially, exposes parallelizable kernels:  
+    - Matrix multiplications  
+    - Column normalizations  
+    - Jacobi rotations on V  
+  * These allow significant speedups on OpenMP/CUDA.  
+
+Hence, BCV-SVD is the practical variant worth optimizing.
+
+
+============================================================
+      Observations Based on bca_svd_report.txt
+============================================================
+
+Time taken by major functions:
+-------------------------------
+- main                : 53.77s (57.97%)  
+- dgemm_simple        : 35.06s (37.80%)  
+- jacobi_eigen_small  : 3.89s  (4.19%)  
+- normalize_columns   : 0.02s  (0.02%)  
+- init_A              : 0.01s  (0.01%)  
+
+
+Hotspots: With reasons why they are parallelizable or not
+---------------------------------------------------------
+- dgemm_simple  
+  * Parallelizable: Yes  
+  * Reason: Matrix multiplication is inherently data-parallel.  
+            Each output element is independent.  
+
+- jacobi_eigen_small  
+  * Parallelizable: Partially  
+  * Reason: Within an iteration, disjoint row/column pairs 
+            can be processed in parallel.  
+            Dependencies across iterations limit full parallelization.  
+
+- normalize_columns  
+  * Parallelizable: Yes  
+  * Reason: Each column can be normalized independently.  
+            Minimal synchronization required.  
+
+- init_A  
+  * Parallelizable: Yes  
+  * Reason: Initializing matrix elements is independent 
+            per entry (embarrassingly parallel).  
+
+- main  
+  * Parallelizable: Indirectly  
+  * Reason: Heavy time usage comes from kernels like 
+            dgemm_simple and jacobi_eigen_small.  
+            Parallelization applies to those kernels, 
+            not main itself.

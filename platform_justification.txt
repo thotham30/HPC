@@ -1,0 +1,13 @@
+# The Chosen Platform with Justification
+The platforms suitable for parallelising are OpenMP and CUDA.
+
+- OpenMP
+  Best for shared-memory CPUs with multi-core parallelism.
+  Handles dgemm_simple, normalize_columns, and init_A efficiently by parallelizing simple loops with low overhead.
+  Also useful for jacobi_eigen_small, where partial parallelism across block pairs is easier to manage on CPUs than GPUs.
+- CUDA
+  Ideal for highly data-parallel kernels like dgemm_simple, where GPUs deliver far higher throughput.
+  Very effective for column-wise operations (normalize_columns, init_A) due to their embarrassingly parallel structure.
+  Can accelerate parts of jacobi_eigen_small at the block level, though dependencies limit full parallelization.
+
+OpenMP provides efficient CPU-side scaling for moderately parallel tasks, while CUDA unlocks massive acceleration for compute-heavy, data-parallel parts. Using both ensures balanced optimization.
