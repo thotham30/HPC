@@ -1,14 +1,16 @@
-/* bcv_nosvd_FIXED.c
+/* bcv_nosvd_mp_CORRECT.c
  * 
- * FIXED VERSION: Correctly handles q-block updates
+ * CORRECT parallelization that produces SAME results as serial version.
  * 
- * The bug was: q-block was updated in U but not stored back to A
- * between p iterations, causing stale data to be reloaded.
+ * Key insight: The (q,p) loop has DATA DEPENDENCIES and CANNOT be parallelized.
+ * We can only parallelize:
+ * 1. Operations within Givens rotations (if m is large enough)
+ * 2. Column normalization
  * 
- * Fix: Don't reload q-block from A each p iteration - keep it in U
+ * This version focuses on correctness first, performance second.
  * 
  * Compile:
- *   gcc -O3 -march=native bcv_nosvd_FIXED.c -o bcv_nosvd_fixed -lm
+ *   gcc -O3 -march=native -fopenmp bcv_nosvd_mp_CORRECT.c -o bcv_nosvd_mp_correct -lm
  */
 
 #define _POSIX_C_SOURCE 200112L
@@ -19,11 +21,12 @@
 #include <math.h>
 #include <sys/time.h>
 #include <string.h>
+#include <omp.h>
 
 double wall_time() {
-    struct timeval tv; 
-    gettimeofday(&tv,NULL); 
-    return tv.tv_sec + tv.tv_usec*1e-6;
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec + tv.tv_usec * 1e-6;
 }
 
 #define A_AT(A,m,row,col) ((A)[(size_t)(col) * (m) + (row)])
@@ -96,23 +99,28 @@ static int load_csv_submatrix(const char *fname, double *A, int m, int n) {
 
 void load_block(double *dst, const double *A, int m, int start_col, int k) {
     for (int j = 0; j < k; ++j) {
-        const double *src = A + (size_t)(start_col + j) * m;
-        double *d = dst + (size_t)j * m;
-        memcpy(d, src, m * sizeof(double));
+        memcpy(dst + (size_t)j * m, 
+               A + (size_t)(start_col + j) * m, 
+               m * sizeof(double));
     }
 }
 
 void store_block(double *A, const double *src, int m, int start_col, int k) {
     for (int j = 0; j < k; ++j) {
-        double *dst = A + (size_t)(start_col + j) * m;
-        const double *s = src + (size_t)j * m;
-        memcpy(dst, s, m * sizeof(double));
+        memcpy(A + (size_t)(start_col + j) * m,
+               src + (size_t)j * m,
+               m * sizeof(double));
     }
 }
 
-/* Givens rotation on 2k columns stored contiguously */
+/* Givens rotation with OPTIONAL parallelization only for VERY large m */
 void givens_rotation_2k(double *U, int m, int k) {
     int two_k = 2 * k;
+    
+    // Only parallelize if m is extremely large AND we have threads available
+    // Otherwise serial is faster due to thread overhead
+    const int PARALLEL_THRESHOLD = 32768;  // Very high threshold
+    int use_parallel = (m >= PARALLEL_THRESHOLD) && (omp_get_max_threads() > 1);
     
     for (int i = 0; i < two_k - 1; ++i) {
         for (int j = i + 1; j < two_k; ++j) {
@@ -120,11 +128,22 @@ void givens_rotation_2k(double *U, int m, int k) {
             double *pj = U + (size_t)j * m;
             
             double alpha = 0.0, beta = 0.0, gamma = 0.0;
-            for (int r = 0; r < m; ++r) {
-                double ui = pi[r], uj = pj[r];
-                alpha += ui * ui;
-                beta  += uj * uj;
-                gamma += ui * uj;
+            
+            if (use_parallel) {
+                #pragma omp parallel for reduction(+:alpha,beta,gamma) schedule(static,1024)
+                for (int r = 0; r < m; ++r) {
+                    double ui = pi[r], uj = pj[r];
+                    alpha += ui * ui;
+                    beta  += uj * uj;
+                    gamma += ui * uj;
+                }
+            } else {
+                for (int r = 0; r < m; ++r) {
+                    double ui = pi[r], uj = pj[r];
+                    alpha += ui * ui;
+                    beta  += uj * uj;
+                    gamma += ui * uj;
+                }
             }
 
             if (fabs(gamma) < 1e-14) continue;
@@ -134,10 +153,19 @@ void givens_rotation_2k(double *U, int m, int k) {
             double c = 1.0 / sqrt(1.0 + t * t);
             double s = t * c;
 
-            for (int r = 0; r < m; ++r) {
-                double ui = pi[r], uj = pj[r];
-                pi[r] = c * ui - s * uj;
-                pj[r] = s * ui + c * uj;
+            if (use_parallel) {
+                #pragma omp parallel for schedule(static,1024)
+                for (int r = 0; r < m; ++r) {
+                    double ui = pi[r], uj = pj[r];
+                    pi[r] = c * ui - s * uj;
+                    pj[r] = s * ui + c * uj;
+                }
+            } else {
+                for (int r = 0; r < m; ++r) {
+                    double ui = pi[r], uj = pj[r];
+                    pi[r] = c * ui - s * uj;
+                    pj[r] = s * ui + c * uj;
+                }
             }
         }
     }
@@ -154,15 +182,16 @@ int main(int argc, char **argv){
     int n = atoi(argv[3]);
     int k = atoi(argv[4]);
     int sweeps = (argc > 5) ? atoi(argv[5]) : 5;
-    const char *outA = (argc > 6) ? argv[6] : "output_A_fixed.csv";
+    const char *outA = (argc > 6) ? argv[6] : "output_A_mp.csv";
 
     if (m <= 0 || n <= 0 || k <= 0 || n % k != 0) {
         fprintf(stderr, "Invalid parameters\n");
         return 1;
     }
 
-    printf("BCV-Jacobi FIXED VERSION on %s (%dx%d) k=%d sweeps=%d\n",
-           csvname, m, n, k, sweeps);
+    int nthreads = omp_get_max_threads();
+    printf("BCV-Jacobi (correct OpenMP) on %s (%dx%d) k=%d sweeps=%d threads=%d\n",
+           csvname, m, n, k, sweeps, nthreads);
 
     double *A = aligned_alloc_d((size_t)m * n);
     if (!A || load_csv_submatrix(csvname, A, m, n) != 0) {
@@ -171,7 +200,6 @@ int main(int argc, char **argv){
     }
     printf("Matrix loaded successfully.\n");
 
-    // Allocate working buffer for 2k columns
     int two_k = 2 * k;
     double *U = aligned_alloc_d((size_t)m * two_k);
     if (!U) { free(A); return 1; }
@@ -180,38 +208,48 @@ int main(int argc, char **argv){
     double t0 = wall_time();
     
     for (int sweep = 0; sweep < sweeps; ++sweep) {
+        // MUST be serial over q (data dependencies)
         for (int q = 0; q < blocks - 1; ++q) {
             // Load q-block into U[:,0:k] ONCE per q
             load_block(U, A, m, q * k, k);
             
+            // MUST be serial over p (data dependencies - each p updates q-block)
             for (int p = q + 1; p < blocks; ++p) {
                 // Load p-block into U[:,k:2k]
                 load_block(U + (size_t)k * m, A, m, p * k, k);
                 
                 // Rotate both blocks in U
                 // This updates BOTH U[:,0:k] and U[:,k:2k]
+                // Can optionally parallelize INSIDE this function if m is huge
                 givens_rotation_2k(U, m, k);
                 
                 // Store p-block (U[:,k:2k]) back to A
                 store_block(A, U + (size_t)k * m, m, p * k, k);
                 
-                // ✅ KEY FIX: q-block (U[:,0:k]) stays in U for next p iteration
-                // It contains accumulated updates from all previous (q,p') pairs
+                // q-block (U[:,0:k]) stays in U for next p iteration
             }
             
             // After all p iterations, store updated q-block back to A
             store_block(A, U, m, q * k, k);
         }
         
-        // Normalize columns
+        // Normalize columns - SAFE to parallelize (independent columns)
+        #pragma omp parallel for schedule(static, 16)
         for (int col = 0; col < n; ++col) {
             double s = 0.0;
             double *colptr = A + (size_t)col * m;
-            for (int i = 0; i < m; ++i) s += colptr[i] * colptr[i];
+            
+            // Could also parallelize this reduction if m is huge
+            for (int i = 0; i < m; ++i) {
+                s += colptr[i] * colptr[i];
+            }
+            
             double nrm = sqrt(s);
             if (nrm > 1e-14) {
                 double inv = 1.0 / nrm;
-                for (int i = 0; i < m; ++i) colptr[i] *= inv;
+                for (int i = 0; i < m; ++i) {
+                    colptr[i] *= inv;
+                }
             }
         }
     }
