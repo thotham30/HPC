@@ -1,12 +1,12 @@
-/* bcv_svd_mp_FIXED.c
- * 
- * FIX: Use persistent thread pool instead of spawning threads repeatedly
- * 
- * Key change: Move #pragma omp parallel OUTSIDE the hot loops
- * Only use #pragma omp for inside the parallel region
- * 
+/* bcv_svd_mp_corrected.c
+ *
+ * Corrected OpenMP BCV-Jacobi implementation with proper synchronization.
+ *
  * Compile:
- *   gcc -O3 -march=native -fopenmp bcv_svd_mp_FIXED.c -o bcv_svd_mp_fixed -lm
+ *   gcc -O3 -march=native -fopenmp bcv_svd_mp_corrected.c -o bcv_svd_mp_corrected -lm
+ *
+ * Run:
+ *   OMP_NUM_THREADS=4 ./bcv_svd_mp_corrected <csv> <m> <n> <k> <sweeps> <outA> <outV>
  */
 
 #define _POSIX_C_SOURCE 200112L
@@ -18,6 +18,7 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <string.h>
+#include <errno.h>
 #include <omp.h>
 
 double wall_time() {
@@ -29,6 +30,7 @@ double wall_time() {
 #define A_AT(A,m,row,col) ((A)[ (size_t)(col) * (m) + (row) ])
 
 static double *aligned_alloc_d(size_t elems) {
+    if (elems == 0) return NULL;
     void *ptr = NULL;
     size_t bytes = elems * sizeof(double);
     if (posix_memalign(&ptr, 64, bytes) != 0) return NULL;
@@ -100,14 +102,11 @@ static int load_csv_submatrix(const char *fname, double *A, int m, int n) {
 }
 
 static void init_V_identity(double *V, int n) {
-    for (int j=0;j<n;++j)
-        for (int i=0;i<n;++i)
-            V[(size_t)j * n + i] = (i==j) ? 1.0 : 0.0;
+    for (int j = 0; j < n; ++j)
+        for (int i = 0; i < n; ++i)
+            V[(size_t)j * n + i] = (i == j) ? 1.0 : 0.0;
 }
 
-/* GEMM - NO #pragma omp parallel here! 
- * Will be called from within existing parallel region
- */
 static void dgemm_simple(char opA, char opB,
                          int m, int n, int k,
                          double alpha,
@@ -116,8 +115,7 @@ static void dgemm_simple(char opA, char opB,
                          double beta,
                          double *C, int ldc)
 {
-    // Use #pragma omp for (not parallel for) - assumes already in parallel region
-    #pragma omp for schedule(static, 4) nowait
+    #pragma omp for schedule(static)
     for (int jc = 0; jc < n; ++jc) {
         for (int ic = 0; ic < m; ++ic) {
             double sum = 0.0;
@@ -140,16 +138,15 @@ static void dgemm_simple(char opA, char opB,
     }
 }
 
-/* Jacobi - keep serial (only 2.1% of time) */
 static void jacobi_eigen_small(double *G, double *R, int k, int max_iter, double tol) {
-    for (int j=0;j<k;++j)
-        for (int i=0;i<k;++i)
-            R[(size_t)j * k + i] = (i==j) ? 1.0 : 0.0;
+    for (int j = 0; j < k; ++j)
+        for (int i = 0; i < k; ++i)
+            R[(size_t)j * k + i] = (i == j) ? 1.0 : 0.0;
 
-    for (int iter=0; iter<max_iter; ++iter) {
-        double max_off = 0.0; int p=-1, q=-1;
-        for (int col=0; col<k; ++col)
-            for (int row=0; row<col; ++row) {
+    for (int iter = 0; iter < max_iter; ++iter) {
+        double max_off = 0.0; int p = -1, q = -1;
+        for (int col = 0; col < k; ++col)
+            for (int row = 0; row < col; ++row) {
                 double a = fabs(G[(size_t)col * k + row]);
                 if (a > max_off) { max_off = a; p = row; q = col; }
             }
@@ -189,16 +186,15 @@ static void jacobi_eigen_small(double *G, double *R, int k, int max_iter, double
 }
 
 static void normalize_columns(double *A, int m, int n) {
-    // Assumes already in parallel region
     #pragma omp for schedule(static, 8)
-    for (int col=0; col<n; ++col) {
+    for (int col = 0; col < n; ++col) {
         double s = 0.0;
         double *colptr = A + (size_t)col * m;
-        for (int i=0;i<m;++i) s += colptr[i]*colptr[i];
+        for (int i = 0; i < m; ++i) s += colptr[i] * colptr[i];
         double nrm = sqrt(s);
         if (nrm > 1e-14) {
             double inv = 1.0 / nrm;
-            for (int i=0;i<m;++i) colptr[i] *= inv;
+            for (int i = 0; i < m; ++i) colptr[i] *= inv;
         }
     }
 }
@@ -215,7 +211,7 @@ int main(int argc, char **argv) {
     if (n % k != 0) { fprintf(stderr, "n must be divisible by k\n"); return 1; }
 
     int nthreads = omp_get_max_threads();
-    printf("BCV-Jacobi WITH V (OpenMP FIXED) on %s (%dx%d), k=%d, sweeps=%d, threads=%d\n",
+    printf("BCV-Jacobi WITH V (OpenMP, corrected) on %s (%dx%d), k=%d, sweeps=%d, threads=%d\n",
            csvname, m, n, k, sweeps, nthreads);
 
     size_t m_n = (size_t)m * n, n_n = (size_t)n * n, two_k = (size_t)2 * k;
@@ -229,12 +225,14 @@ int main(int argc, char **argv) {
     double *Vtmp = aligned_alloc_d((size_t)n * two_k);
 
     if (!A || !V || !Ubuf || !G || !R || !Utmp || !Vsub || !Vtmp) {
-        fprintf(stderr,"Memory allocation failed\n");
+        fprintf(stderr,"Memory allocation failed (errno=%d)\n", errno);
+        free(A); free(V); free(Ubuf); free(G); free(R); free(Utmp); free(Vsub); free(Vtmp);
         return 1;
     }
 
     if (load_csv_submatrix(csvname, A, m, n) != 0) {
         fprintf(stderr, "Failed to load %s as %dx%d matrix\n", csvname, m, n);
+        free(A); free(V); free(Ubuf); free(G); free(R); free(Utmp); free(Vsub); free(Vtmp);
         return 1;
     }
     printf("Matrix loaded successfully.\n");
@@ -243,89 +241,93 @@ int main(int argc, char **argv) {
     int blocks = n / k;
     double t0 = wall_time();
 
-    // ⭐ KEY FIX: Create thread pool ONCE for entire computation
     #pragma omp parallel
     {
-        // All threads stay alive for entire sweep
         for (int sweep = 0; sweep < sweeps; ++sweep) {
             for (int q = 0; q < blocks - 1; ++q) {
-                // Only master thread does serial work
+                /* Master loads q-block into Ubuf[0:k-1] */
                 #pragma omp master
                 {
-                    for (int jj = 0; jj < k; ++jj) {
-                        memcpy(Ubuf + (size_t)jj * m, A + (size_t)(q*k + jj) * m, sizeof(double)*m);
-                    }
+                    for (int jj = 0; jj < k; ++jj)
+                        memcpy(Ubuf + (size_t)jj * m, A + (size_t)(q*k + jj) * m, sizeof(double) * m);
                 }
-                #pragma omp barrier  // Wait for master to finish
-                
+                #pragma omp barrier
+
                 for (int p = q + 1; p < blocks; ++p) {
+                    /* Master loads p-block into Ubuf[k:2k-1] */
                     #pragma omp master
                     {
-                        for (int jj=0;jj<k;++jj)
-                            memcpy(Ubuf + (size_t)(k + jj)*m, A + (size_t)(p*k + jj)*m, sizeof(double)*m);
+                        for (int jj = 0; jj < k; ++jj)
+                            memcpy(Ubuf + (size_t)(k + jj) * m, A + (size_t)(p*k + jj) * m, sizeof(double) * m);
                     }
                     #pragma omp barrier
 
-                    int tk = 2*k;
-                    
-                    // Parallel GEMM (threads already exist)
-                    dgemm_simple('T','N', tk, tk, m, 1.0, Ubuf, m, Ubuf, m, 0.0, G, tk);
+                    int tk = 2 * k;
+
+                    /* G = Ubuf^T * Ubuf */
+                    dgemm_simple('T', 'N', tk, tk, m, 1.0, Ubuf, m, Ubuf, m, 0.0, G, tk);
                     #pragma omp barrier
-                    
-                    // Serial Jacobi (only master does this)
+
+                    /* Jacobi eigendecomposition (serial) */
                     #pragma omp master
                     {
                         jacobi_eigen_small(G, R, tk, 200, 1e-12);
                     }
                     #pragma omp barrier
-                    
-                    // Parallel GEMM
-                    dgemm_simple('N','N', m, tk, tk, 1.0, Ubuf, m, R, tk, 0.0, Utmp, m);
+
+                    /* Utmp = Ubuf * R */
+                    dgemm_simple('N', 'N', m, tk, tk, 1.0, Ubuf, m, R, tk, 0.0, Utmp, m);
                     #pragma omp barrier
-                    
+
+                    /* Master updates Ubuf from Utmp */
                     #pragma omp master
                     {
-                        memcpy(Ubuf, Utmp, sizeof(double)*m*tk);
+                        memcpy(Ubuf, Utmp, sizeof(double) * (size_t)m * tk);
                         
-                        for (int jj=0;jj<k;++jj)
-                            memcpy(Vsub + (size_t)jj*n, V + (size_t)(q*k + jj)*n, sizeof(double)*n);
-                        for (int jj=0;jj<k;++jj)
-                            memcpy(Vsub + (size_t)(k + jj)*n, V + (size_t)(p*k + jj)*n, sizeof(double)*n);
+                        /* Write transformed p-block back to A immediately */
+                        for (int jj = 0; jj < k; ++jj)
+                            memcpy(A + (size_t)(p * k + jj) * m, Ubuf + (size_t)(k + jj) * m, sizeof(double) * m);
+                        
+                        /* Gather V blocks for transformation */
+                        for (int jj = 0; jj < k; ++jj)
+                            memcpy(Vsub + (size_t)jj * n, V + (size_t)(q * k + jj) * n, sizeof(double) * n);
+                        for (int jj = 0; jj < k; ++jj)
+                            memcpy(Vsub + (size_t)(k + jj) * n, V + (size_t)(p * k + jj) * n, sizeof(double) * n);
                     }
                     #pragma omp barrier
-                    
-                    // Parallel GEMM
-                    dgemm_simple('N','N', n, tk, tk, 1.0, Vsub, n, R, tk, 0.0, Vtmp, n);
+
+                    /* Vtmp = Vsub * R */
+                    dgemm_simple('N', 'N', n, tk, tk, 1.0, Vsub, n, R, tk, 0.0, Vtmp, n);
                     #pragma omp barrier
-                    
+
+                    /* Master scatters transformed V back */
                     #pragma omp master
                     {
-                        for (int jj=0;jj<k;++jj)
-                            memcpy(V + (size_t)(q*k + jj)*n, Vtmp + (size_t)jj*n, sizeof(double)*n);
-                        for (int jj=0;jj<k;++jj)
-                            memcpy(V + (size_t)(p*k + jj)*n, Vtmp + (size_t)(k + jj)*n, sizeof(double)*n);
-                        for (int jj=0;jj<k;++jj)
-                            memcpy(A + (size_t)(p*k + jj)*m, Ubuf + (size_t)(k + jj)*m, sizeof(double)*m);
+                        for (int jj = 0; jj < k; ++jj)
+                            memcpy(V + (size_t)(q * k + jj) * n, Vtmp + (size_t)jj * n, sizeof(double) * n);
+                        for (int jj = 0; jj < k; ++jj)
+                            memcpy(V + (size_t)(p * k + jj) * n, Vtmp + (size_t)(k + jj) * n, sizeof(double) * n);
                     }
                     #pragma omp barrier
                 }
-                
+
+                /* After all p iterations, write back q-block */
                 #pragma omp master
                 {
-                    for (int jj=0;jj<k;++jj)
-                        memcpy(A + (size_t)(q*k + jj)*m, Ubuf + (size_t)jj*m, sizeof(double)*m);
+                    for (int jj = 0; jj < k; ++jj)
+                        memcpy(A + (size_t)(q * k + jj) * m, Ubuf + (size_t)jj * m, sizeof(double) * m);
                 }
                 #pragma omp barrier
             }
-            
-            // Parallel normalization
+
+            /* Normalize columns */
             normalize_columns(A, m, n);
             #pragma omp barrier
         }
-    } // Thread pool destroyed here
+    }
 
     double t1 = wall_time();
-    printf("Elapsed time (BCV with V, OpenMP) = %.6f seconds\n", t1 - t0);
+    printf("Elapsed time (BCV with V, OpenMP corrected) = %.6f seconds\n", t1 - t0);
 
     if (outA && strlen(outA) > 0) {
         printf("Saving output matrix A to '%s' ...\n", outA);
