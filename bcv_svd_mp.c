@@ -1,12 +1,18 @@
-/* bcv_svd_mp_corrected.c
+/* bcv_svd_mp.c
  *
- * Corrected OpenMP BCV-Jacobi implementation with proper synchronization.
+ * Hybrid CUDA + OpenMP BCV-Jacobi implementation with SVD.
+ *
+ * Architecture:
+ * - CUDA (cuBLAS) handles large matrix multiplications (GEMM)
+ * - OpenMP handles coordination, small matrix operations (jacobi_eigen), and memory management
+ * - Both technologies work together for optimal performance
  *
  * Compile:
- *   gcc -O3 -march=native -fopenmp bcv_svd_mp_corrected.c -o bcv_svd_mp_corrected -lm
+ *   nvcc -O3 -arch=sm_75 -Xcompiler -fopenmp bcv_svd_mp.c -o bcv_svd_mp -lcublas -lm
+ *   (Adjust -arch based on GPU compute capability)
  *
  * Run:
- *   OMP_NUM_THREADS=4 ./bcv_svd_mp_corrected <csv> <m> <n> <k> <sweeps> <outA> <outV>
+ *   OMP_NUM_THREADS=4 ./bcv_svd_mp <csv> <m> <n> <k> <sweeps> <outA> <outV>
  */
 
 #define _POSIX_C_SOURCE 200112L
@@ -20,6 +26,8 @@
 #include <string.h>
 #include <errno.h>
 #include <omp.h>
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
 
 double wall_time() {
     struct timeval tv;
@@ -29,6 +37,32 @@ double wall_time() {
 
 #define A_AT(A,m,row,col) ((A)[ (size_t)(col) * (m) + (row) ])
 
+/* CUDA error checking macros */
+#define CUDA_CHECK(call) do { \
+    cudaError_t err = call; \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+        exit(1); \
+    } \
+} while(0)
+
+#define CUBLAS_CHECK(call) do { \
+    cublasStatus_t err = call; \
+    if (err != CUBLAS_STATUS_SUCCESS) { \
+        fprintf(stderr, "cuBLAS error at %s:%d: %d\n", __FILE__, __LINE__, err); \
+        exit(1); \
+    } \
+} while(0)
+
+/* Thresholds for choosing execution path */
+#define CUDA_THRESHOLD 1024
+#define OPENMP_THRESHOLD 512
+
+/* Global CUDA state */
+static int cuda_initialized = 0;
+static cublasHandle_t cublas_handle = NULL;
+static cudaDeviceProp device_prop;
+
 static double *aligned_alloc_d(size_t elems) {
     if (elems == 0) return NULL;
     void *ptr = NULL;
@@ -36,6 +70,54 @@ static double *aligned_alloc_d(size_t elems) {
     if (posix_memalign(&ptr, 64, bytes) != 0) return NULL;
     memset(ptr, 0, bytes);
     return (double*)ptr;
+}
+
+/* CUDA initialization */
+static int init_cuda(void) {
+    if (cuda_initialized) return 0;
+    
+    int device_count = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&device_count));
+    if (device_count == 0) {
+        fprintf(stderr, "No CUDA devices found\n");
+        return -1;
+    }
+    
+    CUDA_CHECK(cudaSetDevice(0));
+    CUDA_CHECK(cudaGetDeviceProperties(&device_prop, 0));
+    
+    CUBLAS_CHECK(cublasCreate(&cublas_handle));
+    
+    printf("CUDA initialized: Device %s (Compute %d.%d, %d SMs)\n",
+           device_prop.name, device_prop.major, device_prop.minor, device_prop.multiProcessorCount);
+    
+    cuda_initialized = 1;
+    return 0;
+}
+
+/* CUDA cleanup */
+static void cleanup_cuda(void) {
+    if (cublas_handle) {
+        cublasDestroy(cublas_handle);
+        cublas_handle = NULL;
+    }
+    if (cuda_initialized) {
+        CUDA_CHECK(cudaDeviceReset());
+        cuda_initialized = 0;
+    }
+}
+
+/* CUDA memory allocation wrapper */
+static double *cuda_malloc_d(size_t elems) {
+    double *ptr = NULL;
+    size_t bytes = elems * sizeof(double);
+    CUDA_CHECK(cudaMalloc((void**)&ptr, bytes));
+    return ptr;
+}
+
+/* CUDA memory free wrapper */
+static void cuda_free_d(double *ptr) {
+    if (ptr) CUDA_CHECK(cudaFree(ptr));
 }
 
 static int save_matrix_csv(const char *fname, double *M, int rows, int cols) {
@@ -107,7 +189,45 @@ static void init_V_identity(double *V, int n) {
             V[(size_t)j * n + i] = (i == j) ? 1.0 : 0.0;
 }
 
-static void dgemm_simple(char opA, char opB,
+/* CUDA kernel: Normalize a single column */
+__global__ void normalize_column_kernel_svd(double *colptr, int m, double *norm_out) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    double local_sum = 0.0;
+    
+    for (int i = idx; i < m; i += gridDim.x * blockDim.x) {
+        local_sum += colptr[i] * colptr[i];
+    }
+    
+    // Reduction within block - use dynamic shared memory
+    extern __shared__ double s_sum[];
+    int tid = threadIdx.x;
+    if (tid < blockDim.x) {
+        s_sum[tid] = local_sum;
+    }
+    __syncthreads();
+    
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s && tid + s < blockDim.x) {
+            s_sum[tid] += s_sum[tid + s];
+        }
+        __syncthreads();
+    }
+    
+    if (tid == 0) {
+        atomicAdd(norm_out, s_sum[0]);
+    }
+}
+
+/* CUDA kernel: Apply normalization factor to column */
+__global__ void apply_normalization_kernel_svd(double *colptr, int m, double inv_norm) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < m) {
+        colptr[idx] *= inv_norm;
+    }
+}
+
+/* Hybrid dgemm: cuBLAS for large matrices, OpenMP for smaller ones */
+static void dgemm_hybrid(char opA, char opB,
                          int m, int n, int k,
                          double alpha,
                          const double *A, int lda,
@@ -115,25 +235,69 @@ static void dgemm_simple(char opA, char opB,
                          double beta,
                          double *C, int ldc)
 {
-    #pragma omp for schedule(static)
-    for (int jc = 0; jc < n; ++jc) {
-        for (int ic = 0; ic < m; ++ic) {
-            double sum = 0.0;
-            if (opA == 'N' && opB == 'N') {
-                for (int l = 0; l < k; ++l)
-                    sum += A[(size_t)l * lda + ic] * B[(size_t)jc * ldb + l];
-            } else if (opA == 'T' && opB == 'N') {
-                for (int l = 0; l < k; ++l)
-                    sum += A[(size_t)ic * lda + l] * B[(size_t)jc * ldb + l];
-            } else if (opA == 'N' && opB == 'T') {
-                for (int l = 0; l < k; ++l)
-                    sum += A[(size_t)l * lda + ic] * B[(size_t)l * ldb + jc];
-            } else {
-                for (int l = 0; l < k; ++l)
-                    sum += A[(size_t)ic * lda + l] * B[(size_t)l * ldb + jc];
+    // Use cuBLAS for large matrices, OpenMP for smaller ones
+    int use_cublas = (m > CUDA_THRESHOLD || n > CUDA_THRESHOLD || k > CUDA_THRESHOLD) && cuda_initialized;
+    
+    if (use_cublas) {
+        // cuBLAS path: Transfer to GPU, compute, transfer back
+        // Note: Our matrices use column-major storage (A_AT macro), so cuBLAS works directly
+        double *d_A = NULL, *d_B = NULL, *d_C = NULL;
+        int A_cols = (opA == 'N') ? k : m;
+        int B_cols = (opB == 'N') ? n : k;
+        size_t A_size = (size_t)lda * A_cols * sizeof(double);
+        size_t B_size = (size_t)ldb * B_cols * sizeof(double);
+        size_t C_size = (size_t)ldc * n * sizeof(double);
+        
+        CUDA_CHECK(cudaMalloc((void**)&d_A, A_size));
+        CUDA_CHECK(cudaMalloc((void**)&d_B, B_size));
+        CUDA_CHECK(cudaMalloc((void**)&d_C, C_size));
+        
+        CUDA_CHECK(cudaMemcpy(d_A, A, A_size, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_B, B, B_size, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_C, C, C_size, cudaMemcpyHostToDevice));
+        
+        cublasOperation_t cublas_opA = (opA == 'N') ? CUBLAS_OP_N : CUBLAS_OP_T;
+        cublasOperation_t cublas_opB = (opB == 'N') ? CUBLAS_OP_N : CUBLAS_OP_T;
+        
+        // cuBLAS: C = alpha * op(A) * op(B) + beta * C (column-major)
+        // Function computes: C = opA(A) * opB(B) where C is m×n
+        // For opA='T': A^T is k×m, for opA='N': A is m×k
+        // For opB='T': B^T is n×k, for opB='N': B is k×n
+        // Common dimension between A and B is k
+        int common_dim = k;
+        
+        CUBLAS_CHECK(cublasDgemm(cublas_handle, cublas_opA, cublas_opB,
+                                  m, n, common_dim,
+                                  &alpha, d_A, lda, d_B, ldb,
+                                  &beta, d_C, ldc));
+        
+        CUDA_CHECK(cudaMemcpy(C, d_C, C_size, cudaMemcpyDeviceToHost));
+        
+        cuda_free_d(d_A);
+        cuda_free_d(d_B);
+        cuda_free_d(d_C);
+    } else {
+        // OpenMP path: CPU parallel matrix multiplication
+        #pragma omp for schedule(static)
+        for (int jc = 0; jc < n; ++jc) {
+            for (int ic = 0; ic < m; ++ic) {
+                double sum = 0.0;
+                if (opA == 'N' && opB == 'N') {
+                    for (int l = 0; l < k; ++l)
+                        sum += A[(size_t)l * lda + ic] * B[(size_t)jc * ldb + l];
+                } else if (opA == 'T' && opB == 'N') {
+                    for (int l = 0; l < k; ++l)
+                        sum += A[(size_t)ic * lda + l] * B[(size_t)jc * ldb + l];
+                } else if (opA == 'N' && opB == 'T') {
+                    for (int l = 0; l < k; ++l)
+                        sum += A[(size_t)l * lda + ic] * B[(size_t)l * ldb + jc];
+                } else {
+                    for (int l = 0; l < k; ++l)
+                        sum += A[(size_t)ic * lda + l] * B[(size_t)l * ldb + jc];
+                }
+                double cval = C[(size_t)jc * ldc + ic];
+                C[(size_t)jc * ldc + ic] = alpha * sum + beta * cval;
             }
-            double cval = C[(size_t)jc * ldc + ic];
-            C[(size_t)jc * ldc + ic] = alpha * sum + beta * cval;
         }
     }
 }
@@ -186,15 +350,66 @@ static void jacobi_eigen_small(double *G, double *R, int k, int max_iter, double
 }
 
 static void normalize_columns(double *A, int m, int n) {
-    #pragma omp for schedule(static, 8)
-    for (int col = 0; col < n; ++col) {
-        double s = 0.0;
-        double *colptr = A + (size_t)col * m;
-        for (int i = 0; i < m; ++i) s += colptr[i] * colptr[i];
-        double nrm = sqrt(s);
-        if (nrm > 1e-14) {
-            double inv = 1.0 / nrm;
-            for (int i = 0; i < m; ++i) colptr[i] *= inv;
+    int use_cuda = (m > CUDA_THRESHOLD) && cuda_initialized;
+    
+    if (use_cuda) {
+        // CUDA path: Normalize all columns on GPU
+        double *d_A = NULL;
+        double *d_norms = NULL;
+        size_t A_size = (size_t)m * n * sizeof(double);
+        
+        CUDA_CHECK(cudaMalloc((void**)&d_A, A_size));
+        CUDA_CHECK(cudaMalloc((void**)&d_norms, (size_t)n * sizeof(double)));
+        
+        CUDA_CHECK(cudaMemcpy(d_A, A, A_size, cudaMemcpyHostToDevice));
+        
+        int threads_per_block = 256;
+        int num_blocks = (m + threads_per_block - 1) / threads_per_block;
+        
+        // OpenMP manages parallel column processing
+        #pragma omp for schedule(static, 8)
+        for (int col = 0; col < n; ++col) {
+            double *d_colptr = d_A + (size_t)col * m;
+            double *d_norm = d_norms + col;
+            
+            CUDA_CHECK(cudaMemset(d_norm, 0, sizeof(double)));
+            
+            // Compute norm
+            size_t shared_mem_size = threads_per_block * sizeof(double);
+            normalize_column_kernel_svd<<<num_blocks, threads_per_block, shared_mem_size>>>(
+                d_colptr, m, d_norm);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            
+            // Get norm
+            double nrm;
+            CUDA_CHECK(cudaMemcpy(&nrm, d_norm, sizeof(double), cudaMemcpyDeviceToHost));
+            nrm = sqrt(nrm);
+            
+            if (nrm > 1e-14) {
+                double inv = 1.0 / nrm;
+                apply_normalization_kernel_svd<<<num_blocks, threads_per_block>>>(
+                    d_colptr, m, inv);
+                CUDA_CHECK(cudaDeviceSynchronize());
+            }
+        }
+        
+        // Copy result back
+        CUDA_CHECK(cudaMemcpy(A, d_A, A_size, cudaMemcpyDeviceToHost));
+        
+        cuda_free_d(d_A);
+        cuda_free_d(d_norms);
+    } else {
+        // OpenMP path: CPU parallel normalization
+        #pragma omp for schedule(static, 8)
+        for (int col = 0; col < n; ++col) {
+            double s = 0.0;
+            double *colptr = A + (size_t)col * m;
+            for (int i = 0; i < m; ++i) s += colptr[i] * colptr[i];
+            double nrm = sqrt(s);
+            if (nrm > 1e-14) {
+                double inv = 1.0 / nrm;
+                for (int i = 0; i < m; ++i) colptr[i] *= inv;
+            }
         }
     }
 }
@@ -210,8 +425,14 @@ int main(int argc, char **argv) {
 
     if (n % k != 0) { fprintf(stderr, "n must be divisible by k\n"); return 1; }
 
+    // Initialize CUDA
+    if (init_cuda() != 0) {
+        fprintf(stderr, "CUDA initialization failed - CUDA is required\n");
+        return 1;
+    }
+
     int nthreads = omp_get_max_threads();
-    printf("BCV-Jacobi WITH V (OpenMP, corrected) on %s (%dx%d), k=%d, sweeps=%d, threads=%d\n",
+    printf("BCV-Jacobi WITH V (CUDA+OpenMP hybrid) on %s (%dx%d), k=%d, sweeps=%d, threads=%d\n",
            csvname, m, n, k, sweeps, nthreads);
 
     size_t m_n = (size_t)m * n, n_n = (size_t)n * n, two_k = (size_t)2 * k;
@@ -264,19 +485,19 @@ int main(int argc, char **argv) {
 
                     int tk = 2 * k;
 
-                    /* G = Ubuf^T * Ubuf */
-                    dgemm_simple('T', 'N', tk, tk, m, 1.0, Ubuf, m, Ubuf, m, 0.0, G, tk);
+                    /* G = Ubuf^T * Ubuf - Hybrid cuBLAS/OpenMP */
+                    dgemm_hybrid('T', 'N', tk, tk, m, 1.0, Ubuf, m, Ubuf, m, 0.0, G, tk);
                     #pragma omp barrier
 
-                    /* Jacobi eigendecomposition (serial) */
+                    /* Jacobi eigendecomposition (serial on CPU - too small for GPU) */
                     #pragma omp master
                     {
                         jacobi_eigen_small(G, R, tk, 200, 1e-12);
                     }
                     #pragma omp barrier
 
-                    /* Utmp = Ubuf * R */
-                    dgemm_simple('N', 'N', m, tk, tk, 1.0, Ubuf, m, R, tk, 0.0, Utmp, m);
+                    /* Utmp = Ubuf * R - Hybrid cuBLAS/OpenMP */
+                    dgemm_hybrid('N', 'N', m, tk, tk, 1.0, Ubuf, m, R, tk, 0.0, Utmp, m);
                     #pragma omp barrier
 
                     /* Master updates Ubuf from Utmp */
@@ -296,8 +517,8 @@ int main(int argc, char **argv) {
                     }
                     #pragma omp barrier
 
-                    /* Vtmp = Vsub * R */
-                    dgemm_simple('N', 'N', n, tk, tk, 1.0, Vsub, n, R, tk, 0.0, Vtmp, n);
+                    /* Vtmp = Vsub * R - Hybrid cuBLAS/OpenMP */
+                    dgemm_hybrid('N', 'N', n, tk, tk, 1.0, Vsub, n, R, tk, 0.0, Vtmp, n);
                     #pragma omp barrier
 
                     /* Master scatters transformed V back */
@@ -327,7 +548,7 @@ int main(int argc, char **argv) {
     }
 
     double t1 = wall_time();
-    printf("Elapsed time (BCV with V, OpenMP corrected) = %.6f seconds\n", t1 - t0);
+    printf("Elapsed time (BCV with V, CUDA+OpenMP hybrid) = %.6f seconds\n", t1 - t0);
 
     if (outA && strlen(outA) > 0) {
         printf("Saving output matrix A to '%s' ...\n", outA);
@@ -347,5 +568,6 @@ int main(int argc, char **argv) {
     }
 
     free(A); free(V); free(Ubuf); free(G); free(R); free(Utmp); free(Vsub); free(Vtmp);
+    cleanup_cuda();
     return 0;
 }
