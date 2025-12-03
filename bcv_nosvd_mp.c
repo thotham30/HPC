@@ -1,19 +1,16 @@
-/* bcv_nosvd_mp.c
+/* bcv_nosvd_mp_CORRECT.c
  * 
- * Hybrid CUDA + OpenMP parallelization for BCV-Jacobi algorithm.
+ * CORRECT parallelization that produces SAME results as serial version.
  * 
  * Key insight: The (q,p) loop has DATA DEPENDENCIES and CANNOT be parallelized.
  * We can only parallelize:
- * 1. Operations within Givens rotations (if m is large enough) - CUDA for large, OpenMP for medium
- * 2. Column normalization - CUDA for all columns in parallel
+ * 1. Operations within Givens rotations (if m is large enough)
+ * 2. Column normalization
  * 
- * Architecture:
- * - CUDA handles large matrix operations (m > 1024)
- * - OpenMP handles coordination, medium-sized operations (512 < m <= 1024), and small operations (m <= 512)
+ * This version focuses on correctness first, performance second.
  * 
  * Compile:
- *   nvcc -O3 -arch=sm_75 -Xcompiler -fopenmp bcv_nosvd_mp.c -o bcv_nosvd_mp -lcublas -lm
- *   (Adjust -arch based on GPU compute capability)
+ *   gcc -O3 -march=native -fopenmp bcv_nosvd_mp_CORRECT.c -o bcv_nosvd_mp_correct -lm
  */
 
 #define _POSIX_C_SOURCE 200112L
@@ -25,8 +22,6 @@
 #include <sys/time.h>
 #include <string.h>
 #include <omp.h>
-#include <cuda_runtime.h>
-#include <cublas_v2.h>
 
 double wall_time() {
     struct timeval tv;
@@ -36,79 +31,12 @@ double wall_time() {
 
 #define A_AT(A,m,row,col) ((A)[(size_t)(col) * (m) + (row)])
 
-/* CUDA error checking macros */
-#define CUDA_CHECK(call) do { \
-    cudaError_t err = call; \
-    if (err != cudaSuccess) { \
-        fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
-        exit(1); \
-    } \
-} while(0)
-
-#define CUBLAS_CHECK(call) do { \
-    cublasStatus_t err = call; \
-    if (err != CUBLAS_STATUS_SUCCESS) { \
-        fprintf(stderr, "cuBLAS error at %s:%d: %d\n", __FILE__, __LINE__, err); \
-        exit(1); \
-    } \
-} while(0)
-
-/* Thresholds for choosing execution path */
-#define CUDA_THRESHOLD 1024
-#define OPENMP_THRESHOLD 512
-
-/* Global CUDA state */
-static int cuda_initialized = 0;
-static cudaDeviceProp device_prop;
-
 static double *aligned_alloc_d(size_t elems) {
     void *ptr = NULL;
     size_t bytes = elems * sizeof(double);
     if (posix_memalign(&ptr, 64, bytes) != 0) return NULL;
     memset(ptr, 0, bytes);
     return (double*)ptr;
-}
-
-/* CUDA initialization */
-static int init_cuda(void) {
-    if (cuda_initialized) return 0;
-    
-    int device_count = 0;
-    CUDA_CHECK(cudaGetDeviceCount(&device_count));
-    if (device_count == 0) {
-        fprintf(stderr, "No CUDA devices found\n");
-        return -1;
-    }
-    
-    CUDA_CHECK(cudaSetDevice(0));
-    CUDA_CHECK(cudaGetDeviceProperties(&device_prop, 0));
-    
-    printf("CUDA initialized: Device %s (Compute %d.%d, %d SMs)\n",
-           device_prop.name, device_prop.major, device_prop.minor, device_prop.multiProcessorCount);
-    
-    cuda_initialized = 1;
-    return 0;
-}
-
-/* CUDA cleanup */
-static void cleanup_cuda(void) {
-    if (cuda_initialized) {
-        CUDA_CHECK(cudaDeviceReset());
-        cuda_initialized = 0;
-    }
-}
-
-/* CUDA memory allocation wrapper */
-static double *cuda_malloc_d(size_t elems) {
-    double *ptr = NULL;
-    size_t bytes = elems * sizeof(double);
-    CUDA_CHECK(cudaMalloc((void**)&ptr, bytes));
-    return ptr;
-}
-
-/* CUDA memory free wrapper */
-static void cuda_free_d(double *ptr) {
-    if (ptr) CUDA_CHECK(cudaFree(ptr));
 }
 
 static int save_matrix_csv(const char *fname, double *M, int rows, int cols) {
@@ -185,171 +113,23 @@ void store_block(double *A, const double *src, int m, int start_col, int k) {
     }
 }
 
-/* CUDA kernel: Compute dot products for Givens rotation (alpha, beta, gamma) */
-__global__ void givens_dot_product_kernel(const double *pi, const double *pj, int m,
-                                           double *alpha, double *beta, double *gamma) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    double local_alpha = 0.0, local_beta = 0.0, local_gamma = 0.0;
-    
-    for (int r = idx; r < m; r += gridDim.x * blockDim.x) {
-        double ui = pi[r], uj = pj[r];
-        local_alpha += ui * ui;
-        local_beta  += uj * uj;
-        local_gamma += ui * uj;
-    }
-    
-    // Reduction within block - use dynamic shared memory size
-    extern __shared__ double s_data[];
-    double *s_alpha = s_data;
-    double *s_beta = s_data + blockDim.x;
-    double *s_gamma = s_data + 2 * blockDim.x;
-    
-    int tid = threadIdx.x;
-    if (tid < blockDim.x) {
-        s_alpha[tid] = local_alpha;
-        s_beta[tid] = local_beta;
-        s_gamma[tid] = local_gamma;
-    }
-    __syncthreads();
-    
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s && tid + s < blockDim.x) {
-            s_alpha[tid] += s_alpha[tid + s];
-            s_beta[tid] += s_beta[tid + s];
-            s_gamma[tid] += s_gamma[tid + s];
-        }
-        __syncthreads();
-    }
-    
-    if (tid == 0) {
-        atomicAdd(alpha, s_alpha[0]);
-        atomicAdd(beta, s_beta[0]);
-        atomicAdd(gamma, s_gamma[0]);
-    }
-}
-
-/* CUDA kernel: Apply Givens rotation to matrix columns */
-__global__ void givens_apply_rotation_kernel(double *pi, double *pj, int m, double c, double s) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < m) {
-        double ui = pi[idx], uj = pj[idx];
-        pi[idx] = c * ui - s * uj;
-        pj[idx] = s * ui + c * uj;
-    }
-}
-
-/* CUDA kernel: Normalize a single column */
-__global__ void normalize_column_kernel(double *colptr, int m, double *norm_out) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    double local_sum = 0.0;
-    
-    for (int i = idx; i < m; i += gridDim.x * blockDim.x) {
-        local_sum += colptr[i] * colptr[i];
-    }
-    
-    // Reduction within block - use dynamic shared memory
-    extern __shared__ double s_sum[];
-    int tid = threadIdx.x;
-    if (tid < blockDim.x) {
-        s_sum[tid] = local_sum;
-    }
-    __syncthreads();
-    
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s && tid + s < blockDim.x) {
-            s_sum[tid] += s_sum[tid + s];
-        }
-        __syncthreads();
-    }
-    
-    if (tid == 0) {
-        atomicAdd(norm_out, s_sum[0]);
-    }
-}
-
-/* CUDA kernel: Apply normalization factor to column */
-__global__ void apply_normalization_kernel(double *colptr, int m, double inv_norm) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < m) {
-        colptr[idx] *= inv_norm;
-    }
-}
-
-/* Givens rotation with hybrid CUDA/OpenMP/Serial execution */
+/* Givens rotation with OPTIONAL parallelization only for VERY large m */
 void givens_rotation_2k(double *U, int m, int k) {
     int two_k = 2 * k;
-    int use_cuda = (m > CUDA_THRESHOLD) && cuda_initialized;
-    int use_openmp = (m > OPENMP_THRESHOLD && m <= CUDA_THRESHOLD) && (omp_get_max_threads() > 1);
     
-    if (use_cuda) {
-        // CUDA path: Transfer to GPU, compute, transfer back
-        double *d_U = NULL;
-        double *d_alpha = NULL, *d_beta = NULL, *d_gamma = NULL;
-        size_t U_size = (size_t)m * two_k * sizeof(double);
-        
-        CUDA_CHECK(cudaMalloc((void**)&d_U, U_size));
-        CUDA_CHECK(cudaMalloc((void**)&d_alpha, sizeof(double)));
-        CUDA_CHECK(cudaMalloc((void**)&d_beta, sizeof(double)));
-        CUDA_CHECK(cudaMalloc((void**)&d_gamma, sizeof(double)));
-        
-        CUDA_CHECK(cudaMemcpy(d_U, U, U_size, cudaMemcpyHostToDevice));
-        
-        int threads_per_block = 256;
-        int num_blocks = (m + threads_per_block - 1) / threads_per_block;
-        
-        for (int i = 0; i < two_k - 1; ++i) {
-            for (int j = i + 1; j < two_k; ++j) {
-                double *d_pi = d_U + (size_t)i * m;
-                double *d_pj = d_U + (size_t)j * m;
-                
-                // Reset reduction variables
-                CUDA_CHECK(cudaMemset(d_alpha, 0, sizeof(double)));
-                CUDA_CHECK(cudaMemset(d_beta, 0, sizeof(double)));
-                CUDA_CHECK(cudaMemset(d_gamma, 0, sizeof(double)));
-                
-                // Compute dot products on GPU
-                size_t shared_mem_size = 3 * threads_per_block * sizeof(double);
-                givens_dot_product_kernel<<<num_blocks, threads_per_block, shared_mem_size>>>(
-                    d_pi, d_pj, m, d_alpha, d_beta, d_gamma);
-                CUDA_CHECK(cudaDeviceSynchronize());
-                
-                // Copy results back
-                double alpha, beta, gamma;
-                CUDA_CHECK(cudaMemcpy(&alpha, d_alpha, sizeof(double), cudaMemcpyDeviceToHost));
-                CUDA_CHECK(cudaMemcpy(&beta, d_beta, sizeof(double), cudaMemcpyDeviceToHost));
-                CUDA_CHECK(cudaMemcpy(&gamma, d_gamma, sizeof(double), cudaMemcpyDeviceToHost));
-                
-                if (fabs(gamma) < 1e-14) continue;
-                
-                // Compute rotation parameters on CPU
-                double tau = (beta - alpha) / (2.0 * gamma);
-                double t = (tau >= 0.0 ? 1.0 : -1.0) / (fabs(tau) + sqrt(1.0 + tau * tau));
-                double c = 1.0 / sqrt(1.0 + t * t);
-                double s = t * c;
-                
-                // Apply rotation on GPU
-                givens_apply_rotation_kernel<<<num_blocks, threads_per_block>>>(
-                    d_pi, d_pj, m, c, s);
-                CUDA_CHECK(cudaDeviceSynchronize());
-            }
-        }
-        
-        // Copy result back to host
-        CUDA_CHECK(cudaMemcpy(U, d_U, U_size, cudaMemcpyDeviceToHost));
-        
-        cuda_free_d(d_U);
-        cuda_free_d(d_alpha);
-        cuda_free_d(d_beta);
-        cuda_free_d(d_gamma);
-    } else if (use_openmp) {
-        // OpenMP path: Medium-sized matrices
-        for (int i = 0; i < two_k - 1; ++i) {
-            for (int j = i + 1; j < two_k; ++j) {
-                double *pi = U + (size_t)i * m;
-                double *pj = U + (size_t)j * m;
-                
-                double alpha = 0.0, beta = 0.0, gamma = 0.0;
-                
+    // Only parallelize if m is extremely large AND we have threads available
+    // Otherwise serial is faster due to thread overhead
+    const int PARALLEL_THRESHOLD = 32768;  // Very high threshold
+    int use_parallel = (m >= PARALLEL_THRESHOLD) && (omp_get_max_threads() > 1);
+    
+    for (int i = 0; i < two_k - 1; ++i) {
+        for (int j = i + 1; j < two_k; ++j) {
+            double *pi = U + (size_t)i * m;
+            double *pj = U + (size_t)j * m;
+            
+            double alpha = 0.0, beta = 0.0, gamma = 0.0;
+            
+            if (use_parallel) {
                 #pragma omp parallel for reduction(+:alpha,beta,gamma) schedule(static,1024)
                 for (int r = 0; r < m; ++r) {
                     double ui = pi[r], uj = pj[r];
@@ -357,121 +137,34 @@ void givens_rotation_2k(double *U, int m, int k) {
                     beta  += uj * uj;
                     gamma += ui * uj;
                 }
-
-                if (fabs(gamma) < 1e-14) continue;
-                
-                double tau = (beta - alpha) / (2.0 * gamma);
-                double t = (tau >= 0.0 ? 1.0 : -1.0) / (fabs(tau) + sqrt(1.0 + tau * tau));
-                double c = 1.0 / sqrt(1.0 + t * t);
-                double s = t * c;
-
-                #pragma omp parallel for schedule(static,1024)
-                for (int r = 0; r < m; ++r) {
-                    double ui = pi[r], uj = pj[r];
-                    pi[r] = c * ui - s * uj;
-                    pj[r] = s * ui + c * uj;
-                }
-            }
-        }
-    } else {
-        // Serial path: Small matrices
-        for (int i = 0; i < two_k - 1; ++i) {
-            for (int j = i + 1; j < two_k; ++j) {
-                double *pi = U + (size_t)i * m;
-                double *pj = U + (size_t)j * m;
-                
-                double alpha = 0.0, beta = 0.0, gamma = 0.0;
-                
+            } else {
                 for (int r = 0; r < m; ++r) {
                     double ui = pi[r], uj = pj[r];
                     alpha += ui * ui;
                     beta  += uj * uj;
                     gamma += ui * uj;
                 }
+            }
 
-                if (fabs(gamma) < 1e-14) continue;
-                
-                double tau = (beta - alpha) / (2.0 * gamma);
-                double t = (tau >= 0.0 ? 1.0 : -1.0) / (fabs(tau) + sqrt(1.0 + tau * tau));
-                double c = 1.0 / sqrt(1.0 + t * t);
-                double s = t * c;
+            if (fabs(gamma) < 1e-14) continue;
+            
+            double tau = (beta - alpha) / (2.0 * gamma);
+            double t = (tau >= 0.0 ? 1.0 : -1.0) / (fabs(tau) + sqrt(1.0 + tau * tau));
+            double c = 1.0 / sqrt(1.0 + t * t);
+            double s = t * c;
 
+            if (use_parallel) {
+                #pragma omp parallel for schedule(static,1024)
                 for (int r = 0; r < m; ++r) {
                     double ui = pi[r], uj = pj[r];
                     pi[r] = c * ui - s * uj;
                     pj[r] = s * ui + c * uj;
                 }
-            }
-        }
-    }
-}
-
-/* Normalize columns with hybrid CUDA/OpenMP execution */
-static void normalize_columns_hybrid(double *A, int m, int n) {
-    int use_cuda = (m > CUDA_THRESHOLD) && cuda_initialized;
-    
-    if (use_cuda) {
-        // CUDA path: Normalize all columns on GPU
-        double *d_A = NULL;
-        double *d_norms = NULL;
-        size_t A_size = (size_t)m * n * sizeof(double);
-        
-        CUDA_CHECK(cudaMalloc((void**)&d_A, A_size));
-        CUDA_CHECK(cudaMalloc((void**)&d_norms, (size_t)n * sizeof(double)));
-        
-        CUDA_CHECK(cudaMemcpy(d_A, A, A_size, cudaMemcpyHostToDevice));
-        
-        int threads_per_block = 256;
-        int num_blocks = (m + threads_per_block - 1) / threads_per_block;
-        
-        // OpenMP manages parallel column processing
-        #pragma omp parallel for schedule(static, 8)
-        for (int col = 0; col < n; ++col) {
-            double *d_colptr = d_A + (size_t)col * m;
-            double *d_norm = d_norms + col;
-            
-            CUDA_CHECK(cudaMemset(d_norm, 0, sizeof(double)));
-            
-            // Compute norm
-            size_t shared_mem_size = threads_per_block * sizeof(double);
-            normalize_column_kernel<<<num_blocks, threads_per_block, shared_mem_size>>>(
-                d_colptr, m, d_norm);
-            CUDA_CHECK(cudaDeviceSynchronize());
-            
-            // Get norm
-            double nrm;
-            CUDA_CHECK(cudaMemcpy(&nrm, d_norm, sizeof(double), cudaMemcpyDeviceToHost));
-            nrm = sqrt(nrm);
-            
-            if (nrm > 1e-14) {
-                double inv = 1.0 / nrm;
-                apply_normalization_kernel<<<num_blocks, threads_per_block>>>(
-                    d_colptr, m, inv);
-                CUDA_CHECK(cudaDeviceSynchronize());
-            }
-        }
-        
-        // Copy result back
-        CUDA_CHECK(cudaMemcpy(A, d_A, A_size, cudaMemcpyDeviceToHost));
-        
-        cuda_free_d(d_A);
-        cuda_free_d(d_norms);
-    } else {
-        // OpenMP path: CPU parallel normalization
-        #pragma omp parallel for schedule(static, 16)
-        for (int col = 0; col < n; ++col) {
-            double s = 0.0;
-            double *colptr = A + (size_t)col * m;
-            
-            for (int i = 0; i < m; ++i) {
-                s += colptr[i] * colptr[i];
-            }
-            
-            double nrm = sqrt(s);
-            if (nrm > 1e-14) {
-                double inv = 1.0 / nrm;
-                for (int i = 0; i < m; ++i) {
-                    colptr[i] *= inv;
+            } else {
+                for (int r = 0; r < m; ++r) {
+                    double ui = pi[r], uj = pj[r];
+                    pi[r] = c * ui - s * uj;
+                    pj[r] = s * ui + c * uj;
                 }
             }
         }
@@ -496,27 +189,20 @@ int main(int argc, char **argv){
         return 1;
     }
 
-    // Initialize CUDA
-    if (init_cuda() != 0) {
-        fprintf(stderr, "CUDA initialization failed - CUDA is required\n");
-        return 1;
-    }
-
     int nthreads = omp_get_max_threads();
-    printf("BCV-Jacobi (CUDA+OpenMP hybrid) on %s (%dx%d) k=%d sweeps=%d threads=%d\n",
+    printf("BCV-Jacobi (correct OpenMP) on %s (%dx%d) k=%d sweeps=%d threads=%d\n",
            csvname, m, n, k, sweeps, nthreads);
 
     double *A = aligned_alloc_d((size_t)m * n);
     if (!A || load_csv_submatrix(csvname, A, m, n) != 0) {
         fprintf(stderr, "Failed to load matrix\n");
-        cleanup_cuda();
         return 1;
     }
     printf("Matrix loaded successfully.\n");
 
     int two_k = 2 * k;
     double *U = aligned_alloc_d((size_t)m * two_k);
-    if (!U) { free(A); cleanup_cuda(); return 1; }
+    if (!U) { free(A); return 1; }
 
     int blocks = n / k;
     double t0 = wall_time();
@@ -547,8 +233,25 @@ int main(int argc, char **argv){
             store_block(A, U, m, q * k, k);
         }
         
-        // Normalize columns - Hybrid CUDA/OpenMP
-        normalize_columns_hybrid(A, m, n);
+        // Normalize columns - SAFE to parallelize (independent columns)
+        #pragma omp parallel for schedule(static, 16)
+        for (int col = 0; col < n; ++col) {
+            double s = 0.0;
+            double *colptr = A + (size_t)col * m;
+            
+            // Could also parallelize this reduction if m is huge
+            for (int i = 0; i < m; ++i) {
+                s += colptr[i] * colptr[i];
+            }
+            
+            double nrm = sqrt(s);
+            if (nrm > 1e-14) {
+                double inv = 1.0 / nrm;
+                for (int i = 0; i < m; ++i) {
+                    colptr[i] *= inv;
+                }
+            }
+        }
     }
     
     double t1 = wall_time();
@@ -559,6 +262,5 @@ int main(int argc, char **argv){
     }
 
     free(A); free(U);
-    cleanup_cuda();
     return 0;
 }

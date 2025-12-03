@@ -1,5 +1,10 @@
+#ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200112L
+#endif
+
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -68,12 +73,11 @@ static int load_csv_submatrix(const char *fname, double *A, int m, int n) {
     }
     char *line = NULL;
     size_t len = 0;
-    ssize_t read;
     int row = 0;
     double *rowvals = (double*)malloc(sizeof(double) * n);
     if (!rowvals) { fclose(fp); return -2; }
 
-    while ((read = getline(&line, &len, fp)) != -1 && row < m) {
+    while ((getline(&line, &len, fp)) != -1 && row < m) {
         int col = 0;
         char *ptr = line, *endptr;
         while (col < n) {
